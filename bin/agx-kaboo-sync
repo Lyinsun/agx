@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""将 agy-pool 各账号下的 antigravity-cli conversations（.db / .db-wal / .db-shm）
+以软链同步到真实家目录的 ~/.gemini/antigravity-cli/conversations/，供用量统计工具（如 kaboo-cli）统一扫描。
+
+原则：
+- 不修改、不删除 agy-pool 下的任何源文件；
+- 不覆盖目标目录中原有的非软链真实文件；
+- 仅清理指向 agy-pool 且源已消失的过期/悬空软链（如已 checkpoint 消失的 -wal/-shm）。
+"""
+from __future__ import annotations
+
+import os
+import pwd
+from pathlib import Path
+
+SUFFIXES = (".db", ".db-wal", ".db-shm")
+
+
+def resolve_real_home() -> Path:
+    env_home = (os.environ.get("AGYX_REAL_HOME") or "").strip()
+    if env_home:
+        return Path(env_home)
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except Exception:
+        return Path.home()
+
+
+def is_pool_link(p: Path, accounts_dir: Path) -> bool:
+    if not p.is_symlink():
+        return False
+    try:
+        raw = os.readlink(p)
+    except OSError:
+        return False
+    prefixes = {str(accounts_dir).rstrip("/") + "/", str(accounts_dir.resolve()).rstrip("/") + "/"}
+    return any(raw.startswith(pfx) for pfx in prefixes) or "/agy-pool/accounts/" in raw
+
+
+def sync_conversations(pool_root: Path | None = None, target_dir: Path | None = None) -> dict[str, int]:
+    real_home = resolve_real_home()
+    pool = pool_root or Path(os.environ.get("AGYX_ROOT") or (real_home / ".local/share/agy-pool"))
+    accounts_dir = pool / "accounts"
+    target = target_dir or (real_home / ".gemini/antigravity-cli/conversations")
+    target.mkdir(parents=True, exist_ok=True)
+
+    sources: dict[str, tuple[float, Path]] = {}
+    if accounts_dir.is_dir():
+        for acct_dir in sorted(accounts_dir.iterdir()):
+            conv_dir = acct_dir / "home/.gemini/antigravity-cli/conversations"
+            if not conv_dir.is_dir():
+                continue
+            try:
+                entries = list(conv_dir.iterdir())
+            except OSError:
+                continue
+            for src in entries:
+                if not src.name.endswith(SUFFIXES) or not src.is_file() or src.is_symlink():
+                    continue
+                try:
+                    mtime = src.stat().st_mtime
+                except OSError:
+                    continue
+                prev = sources.get(src.name)
+                if prev is None or mtime > prev[0]:
+                    sources[src.name] = (mtime, src)
+
+    removed = 0
+    for dst in list(target.iterdir()):
+        if not is_pool_link(dst, accounts_dir):
+            continue
+        if dst.name not in sources:
+            try:
+                dst.unlink()
+                removed += 1
+            except OSError:
+                pass
+
+    created = updated = skipped_real = 0
+    for name, (_, src) in sources.items():
+        dst = target / name
+        if dst.is_symlink():
+            try:
+                if os.readlink(dst) == str(src):
+                    continue
+                dst.unlink()
+                dst.symlink_to(src)
+                updated += 1
+            except OSError:
+                pass
+        elif dst.exists():
+            skipped_real += 1
+        else:
+            try:
+                dst.symlink_to(src)
+                created += 1
+            except OSError:
+                pass
+
+    db_count = sum(1 for n in sources if n.endswith(".db"))
+    wal_count = len(sources) - db_count
+    return {
+        "db": db_count,
+        "wal": wal_count,
+        "created": created,
+        "updated": updated,
+        "removed": removed,
+        "skipped_real": skipped_real,
+    }
+
+
+def main() -> int:
+    stats = sync_conversations()
+    print(
+        f"agx-kaboo-sync: total={stats['db']} db + {stats['wal']} wal/shm "
+        f"(created={stats['created']}, updated={stats['updated']}, "
+        f"removed={stats['removed']}, skipped_real={stats['skipped_real']})"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

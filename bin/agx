@@ -1,0 +1,1456 @@
+#!/usr/bin/env bash
+# agyx：多账号 Antigravity CLI（agy）启动器，用法仿 ccd。2026-11-23 起草。
+#
+# 账号池目录（AGYX_ROOT，默认 ~/.local/share/agy-pool）：
+#   accounts/<邮箱前缀>/home/          该账号的 HOME（agy 普通模式只认 HOME，不认 GEMINI_HOME）
+#       .gemini/antigravity-cli/        登录文件 antigravity-oauth-token（600）、日志、会话记录，每个账号独立
+#       .gemini/config、.gemini/skills  软链回真实 ~/.gemini（共用 skill、hook、MCP、插件）
+#       其他顶层文件和目录               软链回真实家目录（git、ssh 等配置照常可用）；.config 里只有 antigravity 是独立的
+#   accounts/<名字>/status              ok | bad:<原因>:<时间> | exhausted:[gemini|claude|argon|all:]<时间>
+#   accounts/<名字>/usage.tsv           最近一次 /usage 的结果
+#   accounts/<名字>/plan                最近一次识别的套餐类型（如 Google AI Ultra / Google AI Pro）
+#   order                               auto 选号顺序，一行一个名字（没有就按名字排序）
+#   PAUSED                              存在时整池暂停，所有调用都拒绝（内容是原因）
+#
+# 命令名：agyx，短名 agx（~/.local/bin/agx 软链到同一个脚本，用法完全相同）。
+# 用法：
+#   agyx [-a 名字|auto] [--safe] [agy 参数…]   启动 agy；默认带 --dangerously-skip-permissions（同 ccd 的 bypass），--safe 不带
+#   agyx -a [agy 参数…]                        -a 后面不写名字：弹出账号菜单，上下键选（可用优先排序，显示套餐；同 agyx select）
+#   agyx -a 名字 acp [参数…]                   ACP 模式，自动加 --gemini-dir / --app-data-dir
+#   agyx login                                  在临时目录里登录一个新号（不动默认 ~/.gemini 的登录），按邮箱前缀存进池
+#   agyx adopt                                  把 login 中断后留下的临时目录里已登录的号存进池
+#   agyx save                                   把默认 ~/.gemini 当前登录的号存进池（按邮箱前缀命名）
+#   agyx ls                                     列出账号、套餐、状态、额度（可用账号排在上面）
+#   agyx usage [名字|all]                       用官方 /usage 读额度（all 默认跳过 bad 号，间隔 20 秒；缺套餐缓存自动补采）
+#   agyx plan [名字|all]                        通过临时 statusLine 探测并缓存套餐类型（默认只探非 bad 账号，零 token 消耗）
+#   agyx models-sync [名字|all]                 缓存各账号的 agy models 可用模型目录（models.txt，零 token，选号时过滤不支持的号）
+#   agyx pick [--prefer-plan pro|ultra] [--explain] [模型]
+#                                               打印 auto 会选哪个号（默认按 Ultra/Pro 加权剩余额度 + 活跃会话 + LRU 轮转）
+#   agyx handoff <会话ID> [目标账号] [--from 源账号] [--no-run] [agy 参数…]
+#                                               将会话数据库与 brain 无损复制到下一个可用号并续跑
+#   AGYX_MIN_PCT（默认 2）：某组额度任一窗口剩余 ≤ 这个百分比且没到重置时间，就当作用尽
+#   AGYX_COOLDOWN_MIN（默认 15）：触发 429/额度耗尽后的短冷却分钟数，防 /usage 滞后复选；设 0 关闭
+#   AGYX_PICK_STRATEGY（默认 spread，可选 order）：spread 按 (套餐权重×剩余额度)/(1+活跃会话数) + LRU 轮转；order 按固定顺序
+#   AGYX_PREFER_PLAN：可选逗号分隔的优先套餐（如 pro / ultra）；不设时全池加权轮转（Ultra 权重 3、Pro 权重 1）
+#   agyx pause [原因] | resume                  整池暂停 / 恢复
+#   agyx env 名字                               打印该账号的环境变量（给别的脚本用）
+#   AGYX_PROXY：默认 keep（沿用当前 shell 代理）；可设为 http://127.0.0.1:7890 等固定出口，或写入 ~/.config/agx/config.env
+# 选号规则（auto）：默认 spread 按 (套餐权重×剩余额度)/(1+活跃会话数) + LRU 动态轮转（设为 order 时按固定顺序用尽再换）；
+#   并发默认不限；要限时设 AGYX_PER_ACCOUNT=N，占满就等，不换号。
+# 风控：一次运行的日志里出现无有效许可 403、TOS_VIOLATION 时，把该号标 bad 并暂停整池，只能人工 resume；账号自身资格不符仅标该号 bad。
+# 不读取、不打印任何登录文件的内容。
+set -u
+
+REAL_HOME="${AGYX_REAL_HOME:-}"
+if [ -z "$REAL_HOME" ]; then
+	REAL_HOME=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)
+	[ -n "$REAL_HOME" ] || REAL_HOME="$HOME"
+fi
+
+# 加载可选配置文件（~/.config/agx/config.env），仅读取 AGX_*/AGYX_* 键，不覆盖已显式传入的环境变量
+load_config_env() {
+	local cfg="${AGX_CONFIG:-$REAL_HOME/.config/agx/config.env}" line key val
+	[ -f "$cfg" ] || return 0
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="${line#"${line%%[![:space:]]*}"}"
+		[ -z "$line" ] || [ "${line#\#}" != "$line" ] && continue
+		line="${line#export }"
+		case "$line" in *=*) ;; *) continue ;; esac
+		key="${line%%=*}"
+		val="${line#*=}"
+		key="${key%"${key##*[![:space:]]}"}"
+		[[ "$key" =~ ^(AGYX|AGX)_[A-Z0-9_]+$ ]] || continue
+		[ -n "${!key+x}" ] && continue
+		val="${val#"${val%%[![:space:]]*}"}"
+		val="${val%"${val##*[![:space:]]}"}"
+		if [[ "$val" == \"*\" && ${#val} -ge 2 ]]; then
+			val="${val:1:${#val}-2}"
+		elif [[ "$val" == \'*\' && ${#val} -ge 2 ]]; then
+			val="${val:1:${#val}-2}"
+		else
+			val="${val%% #*}"
+			val="${val%"${val##*[![:space:]]}"}"
+		fi
+		val="${val//\$HOME/$REAL_HOME}"
+		val="${val//\$\{HOME\}/$REAL_HOME}"
+		export "$key=$val"
+	done < "$cfg"
+}
+load_config_env
+
+ROOT="${AGYX_ROOT:-$REAL_HOME/.local/share/agy-pool}"
+ACC="$ROOT/accounts"
+AGY="${AGYX_AGY:-}"
+if [ -z "$AGY" ]; then
+	if [ -x "$REAL_HOME/.local/bin/agy" ]; then
+		AGY="$REAL_HOME/.local/bin/agy"
+	else
+		AGY="$(command -v agy 2>/dev/null || echo "$REAL_HOME/.local/bin/agy")"
+	fi
+fi
+PER_ACCOUNT="${AGYX_PER_ACCOUNT:-0}"  # 0 = 不限
+COOLDOWN_MIN="${AGYX_COOLDOWN_MIN:-15}"  # 触发 429 后的短冷却分钟数，防 /usage 滞后复选；0 = 关闭
+# 账号自身不符合资格（地区、年龄）：只把该号标 bad，不暂停整池
+ACCT_BAD_RE='Account ineligible: [^.]*|Eligibility check failed'
+# 许可 403、TOS 违规：标 bad 并暂停整池
+POOL_BAD_RE='valid license of this product|TOS_VIOLATION|violation of Terms of Service'
+EXHAUST_RE='RESOURCE_EXHAUSTED|\(code 429\)|Individual quota|quota (has been )?(reached|exceeded|exhausted)|exceeded your (current )?quota|(reached|exceeded) your (usage )?limit|weekly quota|spend cap|prepaid balance'
+# 429 只认错误级别行或明确的推理额度报错；后台 ACL / 遥测接口不算推理额度耗尽
+EXHAUST_LINE_RE='^E[0-9]{4}|errorreport\.go|session\.go|Third-party quota reached|Individual quota reached|weekly quota|spend cap|prepaid balance'
+EXHAUST_IGNORE_RE='writeTrajectoryAcls'
+
+die() { echo "agyx: $*" >&2; exit 2; }
+say() { echo "agyx: $*" >&2; }
+now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+umask 077
+mkdir -p "$ACC"
+
+# ---------- 账号目录 ----------
+acct_dir() { echo "$ACC/$1"; }
+acct_home() { echo "$ACC/$1/home"; }
+token_of() { echo "$1/.gemini/antigravity-cli/antigravity-oauth-token"; }
+
+# 把真实家目录的顶层条目软链进账号 HOME（.gemini、.config 单独处理），缺的补上，已有的不动
+sync_home() {
+	local h="$1" e n
+	mkdir -p "$h/.gemini/antigravity-cli" "$h/.config"
+	chmod 700 "$h" "$h/.gemini" "$h/.gemini/antigravity-cli"
+	for e in "$REAL_HOME"/.[!.]* "$REAL_HOME"/*; do
+		[ -e "$e" ] || [ -L "$e" ] || continue
+		n=$(basename "$e")
+		case "$n" in .gemini|.config) continue ;; esac
+		[ -e "$h/$n" ] || [ -L "$h/$n" ] || ln -s "$e" "$h/$n"
+	done
+	for e in "$REAL_HOME"/.config/* "$REAL_HOME"/.config/.[!.]*; do
+		[ -e "$e" ] || [ -L "$e" ] || continue
+		n=$(basename "$e")
+		[ "$n" = antigravity ] && continue
+		[ -e "$h/.config/$n" ] || [ -L "$h/.config/$n" ] || ln -s "$e" "$h/.config/$n"
+	done
+	for n in config skills GEMINI.md AGENTS.md; do
+		[ -e "$REAL_HOME/.gemini/$n" ] || continue
+		[ -e "$h/.gemini/$n" ] || [ -L "$h/.gemini/$n" ] || ln -s "$REAL_HOME/.gemini/$n" "$h/.gemini/$n"
+	done
+	# 默认启用与 ccd 对齐的自定义状态栏与窗口标题（仅在未配置 command 且未显式关闭时写入，不覆盖用户自定义）
+	if [ -x "$REAL_HOME/.gemini/config/statusline.sh" ] || [ -x "$REAL_HOME/.gemini/config/title.sh" ]; then
+		local sf="$h/.gemini/antigravity-cli/settings.json"
+		local has_sl=0 has_tt=0
+		[ -x "$REAL_HOME/.gemini/config/statusline.sh" ] && has_sl=1
+		[ -x "$REAL_HOME/.gemini/config/title.sh" ] && has_tt=1
+		python3 -I - "$sf" "$has_sl" "$has_tt" <<'PY' 2>/dev/null || true
+import json, os, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+has_sl, has_tt = sys.argv[2] == "1", sys.argv[3] == "1"
+try:
+    d = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+changed = False
+if has_sl:
+    sl = d.get("statusLine")
+    if not (isinstance(sl, dict) and (sl.get("command") or sl.get("enabled") is False)):
+        d["statusLine"] = {
+            "type": "command",
+            "command": "bash ~/.gemini/config/statusline.sh",
+            "padding": 0,
+            "enabled": True,
+        }
+        changed = True
+if has_tt:
+    tt = d.get("title")
+    if not (isinstance(tt, dict) and (tt.get("command") or tt.get("enabled") is False)):
+        d["title"] = {
+            "type": "command",
+            "command": "bash ~/.gemini/config/title.sh",
+            "enabled": True,
+        }
+        changed = True
+if not changed:
+    sys.exit(0)
+tmp = p.with_name(f".settings.{os.getpid()}.tmp")
+tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+os.chmod(tmp, 0o600)
+os.replace(tmp, p)
+PY
+	fi
+}
+
+acct_env() {
+	local a="$1"
+	local h; h=$(acct_home "$a")
+	mkdir -p "$(acct_dir "$a")/tmp"
+	echo "HOME=$h"
+	echo "GEMINI_HOME=$h/.gemini"
+	echo "AGYX_REAL_HOME=$REAL_HOME"
+	echo "TMPDIR=$(acct_dir "$a")/tmp"
+	echo "SSH_CONNECTION=${SSH_CONNECTION:-127.0.0.1 0 127.0.0.1 0}"
+	echo "AGY_ACP_FORCE_FILE_STORAGE=1"
+	echo "AGY_CLI_DISABLE_AUTO_UPDATE=1"
+	proxy_env | tr ' ' '\n' | sed '/^\\$/d;/^$/d'
+}
+
+# 代理：默认 keep（沿用当前 shell 代理）；设 AGYX_PROXY=<地址>（或写入 ~/.config/agx/config.env）可固定走指定出口代理。
+PROXY="${AGYX_PROXY:-keep}"
+NO_PROXY_VAL="${AGYX_NO_PROXY:-localhost,127.0.0.1,::1,10.0.0.0/8}"
+proxy_env() {
+	[ "$PROXY" = keep ] && return 0
+	local np="$NO_PROXY_VAL"
+	echo http_proxy="$PROXY" https_proxy="$PROXY" HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" \
+		all_proxy="$PROXY" ALL_PROXY="$PROXY" no_proxy="$np" NO_PROXY="$np"
+}
+
+run_in() { # run_in <HOME 目录> <命令…>：用指定 HOME 跑
+	local h="$1"; shift
+	local -a px=(); [ "$PROXY" = keep ] || read -r -a px <<< "$(proxy_env)"
+	# 去掉调用方 Claude Code 会话的身份：agy 里的 shell 继承到它的话，lead 脚本会把 agy 当成那个 Claude 会话（2026-11-23 实测会漏）
+	local -a un=(-u CLAUDECODE -u CLAUDE_PID -u CLAUDE_EFFORT -u CCD_WORKER_AGENTS) v
+	for v in $(compgen -e | grep '^CLAUDE_CODE_'); do un+=(-u "$v"); done
+	env "${un[@]}" "${px[@]}" HOME="$h" GEMINI_HOME="$h/.gemini" AGYX_REAL_HOME="$REAL_HOME" TMPDIR="${AGYX_TMP:-$h/../tmp}" \
+		SSH_CONNECTION="${SSH_CONNECTION:-127.0.0.1 0 127.0.0.1 0}" \
+		AGY_ACP_FORCE_FILE_STORAGE=1 AGY_CLI_DISABLE_AUTO_UPDATE=1 "$@"
+}
+
+# 从某个 HOME 的 agy 日志里读最近一次登录成功的邮箱（只看这一行，不碰登录文件）
+email_in_logs() {
+	local d="$1/.gemini/antigravity-cli/log" f
+	[ -d "$d" ] || return 1
+	for f in $(ls -t "$d" 2>/dev/null); do
+		local e
+		e=$(grep -ho 'authenticated successfully as [^ ,]*' "$d/$f" 2>/dev/null | tail -1 | awk '{print $4}')
+		[ -n "$e" ] && { echo "$e"; return 0; }
+	done
+	return 1
+}
+
+name_of_email() { echo "${1%%@*}" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -c 'a-z0-9._\n-' '_'; }
+
+# 把一个临时 HOME（里面已有登录文件）验证后放进池：跑一次 agy models，从日志读邮箱，按前缀命名
+adopt_staging() {
+	local s="$1" email name dst
+	mkdir -p "$s/../tmp"
+	say "验证登录（agy models，一次调用）…"
+	if ! run_in "$s" "$AGY" models </dev/null >/dev/null 2>&1; then
+		say "agy models 失败，登录可能无效；临时目录保留在 $s"
+		return 1
+	fi
+	email=$(email_in_logs "$s") || { say "日志里找不到登录邮箱，临时目录保留在 $s"; return 1; }
+	name=$(name_of_email "$email")
+	[ -n "$name" ] || { say "无法从邮箱解析账号名（$email），临时目录保留在 $s"; return 1; }
+	dst="$ACC/$name"
+	if [ -e "$(token_of "$dst/home")" ]; then
+		mkdir -p "$dst/backup"
+		mv "$(token_of "$dst/home")" "$dst/backup/antigravity-oauth-token.$(date +%Y%m%d%H%M%S)"
+		say "$name 已存在，旧登录文件移到 $dst/backup/"
+	fi
+	mkdir -p "$dst/home/.gemini/antigravity-cli" "$dst/tmp"
+	mv "$(token_of "$s")" "$(token_of "$dst/home")"
+	chmod 600 "$(token_of "$dst/home")"
+	# 日志一起搬过去，以后还能从账号自己的日志确认邮箱
+	mkdir -p "$dst/home/.gemini/antigravity-cli/log"
+	mv "$s/.gemini/antigravity-cli/log/"* "$dst/home/.gemini/antigravity-cli/log/" 2>/dev/null
+	echo "$email" > "$dst/email"
+	local inel; inel=$(grep -rhE "$ACCT_BAD_RE|$POOL_BAD_RE" "$dst/home/.gemini/antigravity-cli/log/" 2>/dev/null | tail -1)
+	if [ -n "$inel" ]; then
+		echo "bad:$(reason_of "$inel"):$(now)" > "$dst/status"
+		say "注意：$email 登录成功，但 Google 判定不符合资格（$(reason_of "$inel")），已标为不可用"
+	else
+		[ -f "$dst/status" ] && grep -q '^bad' "$dst/status" && say "注意：$name 之前标过 $(cat "$dst/status")，没有自动改回 ok，确认后手动 echo ok > $dst/status"
+		[ -f "$dst/status" ] || echo ok > "$dst/status"
+	fi
+	[ -f "$ROOT/order" ] && ! grep -qx "$name" "$ROOT/order" && echo "$name" >> "$ROOT/order"
+	sync_home "$dst/home"
+	rm -rf "$(dirname "$s")"
+	say "已保存：$email → $dst"
+}
+
+cmd_save() {
+	local src; src=$(token_of "$REAL_HOME")
+	[ -f "$src" ] || die "默认 ~/.gemini 里没有登录文件（$src）"
+	local st; st=$(mktemp -d "$ROOT/.staging.XXXXXX")
+	mkdir -p "$st/home/.gemini/antigravity-cli"
+	cp -p "$src" "$(token_of "$st/home")"
+	sync_home "$st/home"
+	adopt_staging "$st/home"
+}
+
+cmd_login() {
+	local st; st=$(mktemp -d "$ROOT/.staging.XXXXXX")
+	mkdir -p "$st/home/.gemini/antigravity-cli" "$st/tmp"
+	sync_home "$st/home"
+	say "在独立目录里启动 agy，按提示用 Google 登录新号；登录完成、看到输入框后输入 /exit 退出。不影响默认 ~/.gemini 的登录。"
+	(cd /tmp && run_in "$st/home" "$AGY" --mode plan) || true
+	[ -f "$(token_of "$st/home")" ] || { say "没有生成登录文件（没登录成功？）。临时目录 $st 已删除。"; rm -rf "$st"; return 1; }
+	adopt_staging "$st/home"
+}
+
+# ---------- 状态与选号 ----------
+list_accounts() {
+	if [ -f "$ROOT/order" ]; then
+		grep -v '^\s*$' "$ROOT/order" | while read -r a; do [ -f "$(token_of "$ACC/$a/home")" ] && echo "$a"; done
+		for d in "$ACC"/*/; do a=$(basename "$d"); grep -qx "$a" "$ROOT/order" || { [ -f "$(token_of "$d/home")" ] && echo "$a"; }; done
+	else
+		for d in "$ACC"/*/; do [ -f "$(token_of "$d/home")" ] && basename "$d"; done
+	fi
+}
+
+status_of() { cat "$ACC/$1/status" 2>/dev/null || echo ok; }
+
+plan_of() {
+	[ -f "$ACC/$1/plan" ] && head -n 1 "$ACC/$1/plan" 2>/dev/null | tr -d '\r'
+}
+
+plan_short() {
+	local p low
+	p=$(plan_of "$1")
+	low="${p,,}"
+	case "$low" in
+		"") echo "-" ;;
+		*ultra*) echo "Ultra" ;;
+		*pro*) echo "Pro" ;;
+		*plus*) echo "Plus" ;;
+		*enterprise*) echo "Ent" ;;
+		*team*|*business*) echo "Team" ;;
+		*free*|*standard*) echo "Free" ;;
+		*) printf '%.8s' "$p" ;;
+	esac
+}
+
+plan_matches() { # plan_matches <acct> <csv_prefs>
+	local a="$1" prefs="${2:-}" p s lp ls item li
+	[ -n "$prefs" ] || return 1
+	p=$(plan_of "$a")
+	[ -n "$p" ] || return 1
+	s=$(plan_short "$a")
+	lp="${p,,}"; ls="${s,,}"
+	local -a pitems=()
+	IFS=',' read -r -a pitems <<< "$prefs"
+	for item in "${pitems[@]}"; do
+		li="${item,,}"
+		li="${li#"${li%%[![:space:]]*}"}"
+		li="${li%"${li##*[![:space:]]}"}"
+		[ -n "$li" ] || continue
+		[ "$ls" = "$li" ] && return 0
+		case "$lp" in *"$li"*) return 0 ;; esac
+	done
+	return 1
+}
+
+# 按「ok 且有额度 → ok 耗尽/exhausted → bad 不可用」分组排序，同组保持 order 原顺序
+list_accounts_sorted() {
+	local model="${1:-}" a st
+	local -a g0=() g1=() g2=()
+	for a in $(list_accounts); do
+		if usable "$a" "$model"; then
+			g0+=("$a")
+		else
+			st=$(status_of "$a")
+			case "$st" in
+				ok|exhausted:*) g1+=("$a") ;;
+				*) g2+=("$a") ;;
+			esac
+		fi
+	done
+	[ ${#g0[@]} -gt 0 ] && printf '%s\n' "${g0[@]}"
+	[ ${#g1[@]} -gt 0 ] && printf '%s\n' "${g1[@]}"
+	[ ${#g2[@]} -gt 0 ] && printf '%s\n' "${g2[@]}"
+	return 0
+}
+
+# 模型属于哪一组额度：Claude / GPT 一组，Argon 一组，其余是 Gemini
+group_of() { case "${1,,}" in *claude*|*gpt*) echo "Claude and GPT models" ;; *argon*) echo "Argon" ;; *) echo "Gemini Models" ;; esac; }
+group_key() {
+	case "$1" in
+		"Claude and GPT models") echo claude ;;
+		"Argon") echo argon ;;
+		"Gemini Models") echo gemini ;;
+		*) echo all ;;
+	esac
+}
+group_name_of_key() {
+	case "$1" in
+		claude) echo "Claude and GPT models" ;;
+		argon) echo "Argon" ;;
+		gemini) echo "Gemini Models" ;;
+		*) return 1 ;;
+	esac
+}
+
+# 旧格式 exhausted:<时间> 等同于 all；新格式只阻断对应模型组
+exhausted_group_of_status() {
+	local rest
+	case "$1" in
+		exhausted:*)
+			rest="${1#exhausted:}"
+			case "$rest" in
+				claude:*) echo claude ;;
+				argon:*) echo argon ;;
+				gemini:*) echo gemini ;;
+				all:*) echo all ;;
+				*) echo all ;;
+			esac ;;
+		*) return 1 ;;
+	esac
+}
+status_blocks_model() {
+	local st="$1" model="${2:-}" sg
+	sg=$(exhausted_group_of_status "$st") || return 1
+	{ [ "$sg" = all ] || [ -z "$model" ]; } && return 0
+	[ "$(group_key "$(group_of "$model")")" = "$sg" ]
+}
+
+# usage.tsv 里该组任一窗口剩 0% 且重置时间未到 → 用尽
+quota_left() {
+	local a="$1" g="$2" f="$ACC/$1/usage.tsv"
+	[ -f "$f" ] || return 0
+	python3 -I - "$f" "$g" "${AGYX_MIN_PCT:-2}" <<'PY'
+import sys, datetime
+f, g, minpct = sys.argv[1], sys.argv[2], float(sys.argv[3])
+now = datetime.datetime.now(datetime.timezone.utc)
+for line in open(f, encoding="utf-8"):
+    p = line.rstrip("\n").split("\t")
+    if len(p) < 4 or p[0] != g:
+        continue
+    try:
+        pct = float(p[2].rstrip("%"))
+        reset = datetime.datetime.fromisoformat(p[3].replace("Z", "+00:00"))
+    except ValueError:
+        continue
+    if pct <= minpct and reset > now:
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+cooldown_file_left() {
+	local f="$1" ts now_s rem_s
+	[ "${COOLDOWN_MIN:-0}" -gt 0 ] 2>/dev/null || return 1
+	[ -f "$f" ] || return 1
+	ts=$(tr -dc '0-9' < "$f" 2>/dev/null)
+	[ -n "$ts" ] || return 1
+	now_s=$(date +%s)
+	rem_s=$(( ts + COOLDOWN_MIN * 60 - now_s ))
+	[ "$rem_s" -gt 0 ] || return 1
+	echo $(( (rem_s + 59) / 60 ))
+	return 0
+}
+
+# 指定组同时受旧版全局 last_429、last_429.all 与自己的 last_429.<组> 约束
+cooldown_left_key() {
+	local a="$1" key="$2" f rem best=0
+	for f in "$ACC/$a/last_429" "$ACC/$a/last_429.all"; do
+		if rem=$(cooldown_file_left "$f"); then [ "$rem" -gt "$best" ] && best="$rem"; fi
+	done
+	if [ "$key" != all ] && rem=$(cooldown_file_left "$ACC/$a/last_429.$key"); then
+		[ "$rem" -gt "$best" ] && best="$rem"
+	fi
+	[ "$best" -gt 0 ] || return 1
+	echo "$best"
+	return 0
+}
+
+# 429 滞后短冷却：按目标模型组检查；未指定模型时任一组冷却都返回 0
+cooldown_left() {
+	local a="$1" model="${2:-}" key rem best=0
+	if [ -n "$model" ]; then
+		cooldown_left_key "$a" "$(group_key "$(group_of "$model")")"
+		return $?
+	fi
+	for key in all claude gemini argon; do
+		if rem=$(cooldown_left_key "$a" "$key"); then [ "$rem" -gt "$best" ] && best="$rem"; fi
+	done
+	[ "$best" -gt 0 ] || return 1
+	echo "$best"
+	return 0
+}
+
+cooldown_tags() {
+	local a="$1" key label f rem best=0 tags=""
+	for f in "$ACC/$a/last_429" "$ACC/$a/last_429.all"; do
+		if rem=$(cooldown_file_left "$f"); then [ "$rem" -gt "$best" ] && best="$rem"; fi
+	done
+	[ "$best" -gt 0 ] && tags=" [全部冷却 ${best}m]"
+	for key in claude gemini argon; do
+		if rem=$(cooldown_file_left "$ACC/$a/last_429.$key"); then
+			case "$key" in claude) label=C ;; gemini) label=G ;; argon) label=A ;; esac
+			tags="$tags [${label}冷却 ${rem}m]"
+		fi
+	done
+	printf '%s' "$tags"
+}
+
+usable() {
+	local a="$1" model="${2:-}" st
+	st=$(status_of "$a")
+	case "$st" in ok|exhausted:*) ;; *) return 1 ;; esac
+	if status_blocks_model "$st" "$model"; then
+		local f="$ACC/$a/usage.tsv"
+		[ -f "$f" ] && [ "$f" -nt "$ACC/$a/status" ] || return 1
+	fi
+	cooldown_left "$a" "$model" >/dev/null && return 1
+	quota_left "$a" "$(group_of "$model")"
+}
+
+# exhausted:* 账号是否已到复查时机：目标组仍在 429 短冷却或 usage.tsv 中仍有未到期的耗尽窗口时不查；
+# 否则若距离标记已满 min_age 分钟（或 usage.tsv 里的重置时间已过且缓存已旧），允许自动刷新一次 /usage 复判。
+exhausted_ready() {
+	local a="$1" model="$2" min_age="$3" stf="$ACC/$1/status" uf="$ACC/$1/usage.tsv" now_s st_s
+	status_blocks_model "$(status_of "$a")" "$model" || return 1
+	cooldown_left "$a" "$model" >/dev/null && return 1
+	[ -f "$uf" ] && ! quota_left "$a" "$(group_of "$model")" && return 1
+	now_s=$(date +%s)
+	st_s=$(date -r "$stf" +%s 2>/dev/null || echo 0)
+	[ $(( (now_s - st_s) / 60 )) -ge "$min_age" ]
+}
+
+# 内部：判断账号是否在 AGYX_EXCLUDE_ACCOUNTS（逗号分隔）排除名单里
+is_excluded() {
+	local a="$1" csv="${AGYX_EXCLUDE_ACCOUNTS:-}" item
+	[ -n "$csv" ] || return 1
+	local -a items=()
+	IFS=',' read -r -a items <<< "$csv"
+	for item in "${items[@]}"; do
+		item="${item#"${item%%[![:space:]]*}"}"
+		item="${item%"${item##*[![:space:]]}"}"
+		[ -n "$item" ] && [ "$item" = "$a" ] && return 0
+	done
+	return 1
+}
+
+# 内部：验证单个候选账号是否可用（缓存超期先刷新；exhausted:* 到期自动复查恢复）；可用返回 0，整池暂停返回 2，不可用返回 1
+_try_pick_one() {
+	local a="$1" model="$2" max="$3" f age st
+	is_excluded "$a" && return 1
+	if ! usable "$a" "$model"; then
+		st=$(status_of "$a")
+		case "$st" in
+			exhausted:*)
+				[ "$max" -gt 0 ] || return 1
+				exhausted_ready "$a" "$model" "$max" || return 1
+				say "$a 曾标记额度用尽，现自动刷新复查"
+				cmd_usage "$a" >&2
+				[ -f "$ROOT/PAUSED" ] && return 2
+				usable "$a" "$model" || { say "$a 额度仍不足，换下一个"; return 1; }
+				return 0
+				;;
+			*) return 1 ;;
+		esac
+	fi
+	f="$ACC/$a/usage.tsv"
+	if [ "$max" -gt 0 ]; then
+		age=$(( ( $(date +%s) - $(date -r "$f" +%s 2>/dev/null || echo 0) ) / 60 ))
+		if [ "$age" -ge "$max" ]; then
+			if [ -f "$f" ]; then say "$a 的额度缓存已过 ${age} 分钟，先刷新"; else say "$a 还没有额度缓存，先读一次"; fi
+			cmd_usage "$a" >&2
+			[ -f "$ROOT/PAUSED" ] && return 2
+			usable "$a" "$model" || { say "$a 额度不足，换下一个"; return 1; }
+		fi
+	fi
+	return 0
+}
+
+# 按「套餐权重 × 剩余额度 / (1 + 活跃会话数) + LRU」为候选账号排位（AGYX_PICK_STRATEGY=spread，默认；设为 order 退回固定顺序）
+rank_accounts_for_pick() {
+	local model="${1:-}" prefer="${2:-}" explain="${3:-0}"
+	local gname gkey strategy="${AGYX_PICK_STRATEGY:-spread}" accts
+	accts=$(cat)
+	gname=$(group_of "$model")
+	gkey=$(group_key "$gname")
+	python3 -I - "$ACC" "$model" "$gname" "$gkey" "$prefer" "$strategy" "$explain" \
+		"${AGYX_ULTRA_WEIGHT:-3.0}" "${AGYX_PRO_WEIGHT:-1.0}" "${AGYX_MIN_PCT:-2}" "${COOLDOWN_MIN:-15}" \
+		"${AGYX_EXCLUDE_ACCOUNTS:-}" "$accts" <<'PY'
+import datetime, os, re, sys
+from pathlib import Path
+
+acc_dir = Path(sys.argv[1])
+model = sys.argv[2]
+gname = sys.argv[3]
+gkey = sys.argv[4]
+prefer_csv = sys.argv[5]
+strategy = (sys.argv[6] or "spread").strip().lower()
+explain = sys.argv[7] == "1"
+w_ultra = float(sys.argv[8])
+w_pro = float(sys.argv[9])
+min_pct = float(sys.argv[10])
+cooldown_min = int(float(sys.argv[11] or 0))
+excl_csv = sys.argv[12]
+
+all_accts = [ln.strip() for ln in sys.argv[13].splitlines() if ln.strip()]
+excluded = {x.strip() for x in excl_csv.split(",") if x.strip()}
+prefs = [x.strip().lower() for x in prefer_csv.split(",") if x.strip()]
+
+# 统计本机当前各账号活跃的 agy 进程数（读 /proc/*/cmdline 与 environ，零守护进程）
+live_counts: dict[str, int] = {}
+acc_resolved = str(acc_dir.resolve())
+acc_raw = str(acc_dir)
+prefixes = {acc_resolved.rstrip("/") + "/", acc_raw.rstrip("/") + "/"}
+try:
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmd = Path(entry.path, "cmdline").read_bytes().split(b"\0")
+            if not cmd or not cmd[0]:
+                continue
+            base = os.path.basename(cmd[0].decode("utf-8", errors="ignore"))
+            if base != "agy":
+                continue
+            env_b = Path(entry.path, "environ").read_bytes().split(b"\0")
+            home_val = ""
+            for kv in env_b:
+                if kv.startswith(b"HOME="):
+                    home_val = kv[5:].decode("utf-8", errors="ignore")
+                    break
+            if not home_val:
+                continue
+            for pfx in prefixes:
+                if home_val.startswith(pfx):
+                    rest = home_val[len(pfx):]
+                    acct = rest.split("/", 1)[0]
+                    if acct:
+                        live_counts[acct] = live_counts.get(acct, 0) + 1
+                    break
+        except OSError:
+            continue
+except OSError:
+    pass
+
+now_dt = datetime.datetime.now(datetime.timezone.utc)
+now_ts = int(now_dt.timestamp())
+
+def read_first_line(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
+    except Exception:
+        return ""
+
+def plan_short_and_weight(plan_raw: str) -> tuple[str, float]:
+    low = plan_raw.lower()
+    if "ultra" in low:
+        return "Ultra", w_ultra
+    if "pro" in low:
+        return "Pro", w_pro
+    if "plus" in low:
+        return "Plus", w_pro
+    if "enterprise" in low:
+        return "Ent", w_pro
+    if "team" in low or "business" in low:
+        return "Team", w_pro
+    if "free" in low or "standard" in low:
+        return "Free", 0.5
+    return "-", 0.8
+
+def matches_prefer(plan_raw: str, pshort: str) -> bool:
+    if not prefs:
+        return False
+    lp, ls = plan_raw.lower(), pshort.lower()
+    return any(item == ls or (lp and item in lp) for item in prefs)
+
+def quota_score(d: Path) -> tuple[float, bool]:
+    """返回 (剩余比例 0..1, 缓存是否已知且未耗尽)"""
+    uf = d / "usage.tsv"
+    if not uf.is_file():
+        return 0.5, True
+    vals: list[float] = []
+    exhausted = False
+    try:
+        for ln in uf.read_text(encoding="utf-8", errors="ignore").splitlines():
+            p = ln.split("\t")
+            if len(p) < 4 or p[0] != gname:
+                continue
+            try:
+                pct = float(p[2].rstrip("%"))
+                reset = datetime.datetime.fromisoformat(p[3].replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if reset <= now_dt:
+                vals.append(1.0)
+            else:
+                vals.append(max(0.0, min(1.0, pct / 100.0)))
+                if pct <= min_pct:
+                    exhausted = True
+    except OSError:
+        return 0.5, True
+    if not vals:
+        return 0.5, True
+    return min(vals), not exhausted
+
+def model_supported(d: Path) -> bool:
+    """若账号目录下缓存了 models.txt 且指定了目标 model，过滤掉明确不含该模型的号。"""
+    if not model:
+        return True
+    mf = d / "models.txt"
+    if not mf.is_file():
+        return True
+    try:
+        txt = mf.read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return True
+    if not txt.strip():
+        return True
+    norm_txt = re.sub(r"[^a-z0-9]+", " ", txt)
+    req_tokens = [t for t in re.sub(r"[^a-z0-9]+", " ", model.lower()).split() if t not in ("low", "medium", "high", "xhigh", "thinking")]
+    return all(re.search(rf"\b{re.escape(t)}\b", norm_txt) for t in req_tokens) if req_tokens else True
+
+def in_cd(d: Path) -> bool:
+    if cooldown_min <= 0:
+        return False
+    for name in ("last_429", "last_429.all", f"last_429.{gkey}"):
+        f = d / name
+        if not f.is_file():
+            continue
+        try:
+            ts = int(re.sub(r"[^0-9]", "", f.read_text(encoding="utf-8", errors="ignore")) or "0")
+        except Exception:
+            ts = 0
+        if ts and ts + cooldown_min * 60 > now_ts:
+            return True
+    return False
+
+rows = []
+for idx, a in enumerate(all_accts):
+    d = acc_dir / a
+    st = read_first_line(d / "status") or "ok"
+    plan_raw = read_first_line(d / "plan")
+    pshort, weight = plan_short_and_weight(plan_raw)
+    score, q_ok = quota_score(d)
+    live = live_counts.get(a, 0)
+    try:
+        last_used = int(re.sub(r"[^0-9]", "", (d / "last_used").read_text(encoding="utf-8", errors="ignore")) or "0")
+    except Exception:
+        last_used = 0
+    avail = (weight * score) / (1.0 + live)
+    pref_tier = 0 if (prefs and matches_prefer(plan_raw, pshort)) else (1 if prefs else 0)
+    ok_model = model_supported(d)
+    # 不可用项仍排后（交由 _try_pick_one 处理 exhausted 到期复查）
+    is_bad = not (st == "ok" or st.startswith("exhausted:"))
+    rows.append({
+        "acct": a, "idx": idx, "st": st, "is_bad": is_bad, "excluded": a in excluded,
+        "pshort": pshort, "weight": weight, "score": score, "q_ok": q_ok,
+        "live": live, "avail": avail, "last_used": last_used, "pref_tier": pref_tier,
+        "cd": in_cd(d), "ok_model": ok_model,
+    })
+
+if strategy == "order":
+    rows.sort(key=lambda r: (r["pref_tier"], r["idx"]))
+else:
+    # 先按 prefer_plan 分桶（若指定），再跳过不支持模型/坏号，按 5% 量化 avail_score 降序，同档按 LRU（last_used 升序）打平
+    rows.sort(key=lambda r: (
+        r["pref_tier"],
+        0 if (not r["is_bad"] and r["ok_model"]) else 1,
+        -round(r["avail"] * 20),
+        r["last_used"],
+        r["idx"],
+    ))
+
+if explain:
+    print(f"{'ACCOUNT':20s} {'PLAN':6s} {'WT':4s} {'SCORE':6s} {'LIVE':4s} {'AVAIL':6s} {'STATUS':22s} {'FLAGS'}", file=sys.stderr)
+    for r in rows:
+        if r["is_bad"]:
+            continue
+        flags = []
+        if r["excluded"]: flags.append("excl")
+        if r["cd"]: flags.append("cd")
+        if not r["q_ok"]: flags.append("low")
+        if not r["ok_model"]: flags.append("no-model")
+        if r["last_used"]: flags.append("lru=" + datetime.datetime.fromtimestamp(r["last_used"]).strftime("%H:%M"))
+        print(f"{r['acct']:20s} {r['pshort']:6s} {r['weight']:4.1f} {r['score']*100:5.0f}% {r['live']:4d} {r['avail']:6.2f} {r['st'][:22]:22s} {' '.join(flags)}", file=sys.stderr)
+
+for r in rows:
+    if r["is_bad"] or not r["ok_model"]:
+        continue
+    print(r["acct"])
+PY
+}
+
+# 额度缓存超过 AGYX_REFRESH_MIN 分钟（默认 30）就先用 /usage 刷新一次再判断；AGYX_REFRESH_MIN=0 不刷新
+# 默认按「套餐权重 × 剩余额度 / (1 + 活跃会话数) + LRU」全池轮转（AGYX_PICK_STRATEGY=order 可退回固定顺序）；
+# 可选 --prefer-plan <csv> 或 AGYX_PREFER_PLAN（如 pro / ultra）限定优先套餐。
+cmd_pick() {
+	local prefer="${AGYX_PREFER_PLAN:-}" model="" a rc max="${AGYX_REFRESH_MIN:-30}" explain="${AGYX_PICK_EXPLAIN:-0}"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--prefer-plan) prefer="${2:-}"; shift $(($# >= 2 ? 2 : 1)) ;;
+			--prefer-plan=*) prefer="${1#*=}"; shift ;;
+			--explain) explain=1; shift ;;
+			--model) model="${2:-}"; shift $(($# >= 2 ? 2 : 1)) ;;
+			--model=*) model="${1#*=}"; shift ;;
+			*) [ -z "$model" ] && model="$1"; shift ;;
+		esac
+	done
+	case "${prefer,,}" in ""|none|off|0|auto) prefer="" ;; esac
+	local -a ranked=()
+	mapfile -t ranked < <(list_accounts | rank_accounts_for_pick "$model" "$prefer" "$explain")
+	for a in "${ranked[@]}"; do
+		_try_pick_one "$a" "$model" "$max"; rc=$?
+		[ "$rc" -eq 0 ] && { echo "$a"; return 0; }
+		[ "$rc" -eq 2 ] && return 1
+	done
+	return 1
+}
+
+check_paused() { [ -f "$ROOT/PAUSED" ] && die "账号池已暂停：$(cat "$ROOT/PAUSED")。处理完后运行 agyx resume"; return 0; }
+
+pause_pool() { echo "$(now) $*" > "$ROOT/PAUSED"; say "已暂停整个账号池：$*"; }
+
+# 启动 agy 前记录已有日志路径；运行后只看本次新建的 cli-*.log，绝不扫并发或历史日志
+snapshot_log_files() {
+	local a="$1" before_list="$2" d
+	d="$(acct_home "$a")/.gemini/antigravity-cli/log"
+	if [ -d "$d" ]; then
+		find "$d" -maxdepth 1 -type f -name 'cli-*.log' -print 2>/dev/null | LC_ALL=C sort > "$before_list"
+	else
+		: > "$before_list"
+	fi
+}
+
+scan_logs() {
+	local a="$1" before_list="$2" model="${3:-}" d f hit group
+	d="$(acct_home "$a")/.gemini/antigravity-cli/log"
+	[ -d "$d" ] && [ -f "$before_list" ] || return 0
+	while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		grep -Fqx -- "$f" "$before_list" && continue
+		hit=$(grep -hoE "$POOL_BAD_RE" "$f" | head -1)
+		if [ -n "$hit" ]; then
+			echo "bad:$hit:$(now)" > "$ACC/$a/status"
+			pause_pool "$a 出现「$hit」（日志 $f）"
+			return 1
+		fi
+		hit=$(grep -hE "$ACCT_BAD_RE" "$f" | head -1)
+		if [ -n "$hit" ]; then
+			echo "bad:$(reason_of "$hit"):$(now)" > "$ACC/$a/status"
+			say "$a 不符合资格（$(reason_of "$hit")），已标为不可用，auto 会跳过它；其他号不受影响"
+			return 1
+		fi
+		hit=$(grep -ihE "$EXHAUST_LINE_RE" "$f" 2>/dev/null | grep -ivE "$EXHAUST_IGNORE_RE" | grep -ihE "$EXHAUST_RE" | head -1)
+		if [ -n "$hit" ]; then
+			group=all
+			if printf '%s\n' "$hit" | grep -qi 'Third-party quota reached'; then
+				group=claude
+			elif [ -n "$model" ]; then
+				group=$(group_key "$(group_of "$model")")
+			fi
+			echo "exhausted:$group:$(now)" > "$ACC/$a/status"
+			date +%s > "$ACC/$a/last_429.$group"
+			say "$a 的 $group 组额度用尽，已进入 ${COOLDOWN_MIN}m 冷却；其他模型组不受影响"
+		fi
+	done < <(find "$d" -maxdepth 1 -type f -name 'cli-*.log' -print 2>/dev/null | LC_ALL=C sort)
+	return 0
+}
+
+reason_of() { case "$1" in *location*) echo 地区不支持 ;; *18\ years*|*age*) echo 年龄未验证 ;; *) echo 资格检查失败 ;; esac; }
+
+# 通过临时 statusLine 回调无消耗读取 plan_tier（约 4~6 秒、零 token、不碰凭据文件）
+PROBE_PLAN_ERR=""
+probe_plan() {
+	local a="$1" h out kind val
+	PROBE_PLAN_ERR=""
+	[ -f "$(token_of "$ACC/$a/home")" ] || { PROBE_PLAN_ERR="缺少登录文件"; return 1; }
+	h=$(acct_home "$a")
+	mkdir -p "$ACC/$a/tmp"
+	sync_home "$h"
+	out=$(run_in "$h" python3 -I - "$AGY" <<'PY' 2>/dev/null
+import fcntl, json, os, pty, select, shlex, shutil, signal, struct, subprocess, sys, tempfile, termios, time
+
+agy_bin = sys.argv[1]
+td = tempfile.mkdtemp(prefix="agx_tier_")
+out_file = os.path.join(td, "status.json")
+q_dir = shlex.quote(td)
+q_out = shlex.quote(out_file)
+# 每次回调写独立临时文件再原子替换，避免并发回调或读写截断
+cmd = f'f={q_dir}/s.$$.tmp; cat > "$f" && mv -f "$f" {q_out}'
+settings = json.dumps({
+    "statusLine": {
+        "type": "command",
+        "command": cmd,
+        "enabled": True,
+        "padding": 0,
+    }
+})
+master, slave = pty.openpty()
+try:
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+except OSError:
+    pass
+
+proc = None
+tier = ""
+err = ""
+pty_buf = bytearray()
+try:
+    proc = subprocess.Popen(
+        [agy_bin, "--settings", settings],
+        cwd="/tmp",
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+        start_new_session=True,
+    )
+    os.close(slave)
+    slave = -1
+    deadline = time.time() + 25.0
+    idle_at = None
+    while time.time() < deadline:
+        r, _, _ = select.select([master], [], [], 0.2)
+        if r:
+            try:
+                chunk = os.read(master, 4096)
+                if not chunk:
+                    break
+                pty_buf.extend(chunk)
+                if len(pty_buf) > 16384:
+                    del pty_buf[:-16384]
+            except OSError:
+                break
+        if b"Select login method" in pty_buf:
+            err = "not_signed_in"
+            break
+        if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+            try:
+                with open(out_file, encoding="utf-8", errors="ignore") as fh:
+                    d = json.loads(fh.read())
+                pt = (d.get("plan_tier") or "").strip()
+                if pt:
+                    tier = pt
+                    break
+                # 仅在已认证且离开 authenticating/initializing 后仍长时间无 plan_tier 时提前结束，
+                # 避免在 3 次 loadCodeAssist 期间（通常 3~5 秒）过早终止
+                st_val = (d.get("agent_state") or "").strip().lower()
+                if d.get("email") and st_val not in ("", "authenticating", "initializing"):
+                    if idle_at is None:
+                        idle_at = time.time()
+                    elif time.time() - idle_at >= 6.0:
+                        err = "no_plan_tier"
+                        break
+            except Exception:
+                pass
+        if proc.poll() is not None:
+            break
+    if not tier and not err:
+        err = "timeout"
+finally:
+    if slave >= 0:
+        try: os.close(slave)
+        except OSError: pass
+    if proc is not None:
+        try: os.killpg(proc.pid, signal.SIGTERM)
+        except OSError: pass
+        try: proc.wait(timeout=2)
+        except Exception:
+            try: os.killpg(proc.pid, signal.SIGKILL)
+            except OSError: pass
+            try: proc.wait(timeout=1)
+            except Exception: pass
+    try: os.close(master)
+    except OSError: pass
+    shutil.rmtree(td, ignore_errors=True)
+
+if tier:
+    print("OK\t" + tier)
+else:
+    print("ERR\t" + (err or "unknown"))
+PY
+	)
+	kind="${out%%$'\t'*}"
+	val="${out#*$'\t'}"
+	if [ "$kind" = OK ] && [ -n "$val" ]; then
+		printf '%s\n' "$val" > "$ACC/$a/plan"
+		return 0
+	fi
+	case "$val" in
+		not_signed_in) PROBE_PLAN_ERR="登录已失效（token 无法刷新），需重新 agx login" ;;
+		no_plan_tier) PROBE_PLAN_ERR="状态栏未返回 plan_tier" ;;
+		timeout) PROBE_PLAN_ERR="超时未返回 plan_tier" ;;
+		*) PROBE_PLAN_ERR="${val:-未知错误}" ;;
+	esac
+	return 1
+}
+
+cmd_plan() {
+	local which="${1:-all}" a first=1 st
+	local -a list=()
+	if [ "$which" = all ]; then
+		for a in $(list_accounts_sorted); do
+			st=$(status_of "$a")
+			case "$st" in
+				ok|exhausted:*) list+=("$a") ;;
+			esac
+		done
+	else
+		list=("$which")
+	fi
+	for a in "${list[@]}"; do
+		[ -f "$(token_of "$ACC/$a/home")" ] || { say "没有账号 $a"; continue; }
+		[ $first = 1 ] || sleep 2
+		first=0
+		if probe_plan "$a"; then
+			printf '%-20s %-18s (%s)\n' "$a" "$(plan_of "$a")" "$(plan_short "$a")"
+		else
+			printf '%-20s 读取套餐失败%s\n' "$a" "${PROBE_PLAN_ERR:+（$PROBE_PLAN_ERR）}"
+		fi
+	done
+}
+
+cmd_models_sync() {
+	local which="${1:-all}" a first=1 st
+	local -a list=()
+	if [ "$which" = all ]; then
+		for a in $(list_accounts_sorted); do
+			st=$(status_of "$a")
+			case "$st" in
+				ok|exhausted:*) list+=("$a") ;;
+			esac
+		done
+	else
+		list=("$which")
+	fi
+	for a in "${list[@]}"; do
+		[ -f "$(token_of "$ACC/$a/home")" ] || { say "没有账号 $a"; continue; }
+		[ $first = 1 ] || sleep 1
+		first=0
+		sync_home "$(acct_home "$a")"
+		local before_list; before_list=$(mktemp)
+		snapshot_log_files "$a" "$before_list"
+		local out rc=0
+		out=$( (cd /tmp && run_in "$(acct_home "$a")" "$AGY" models) </dev/null 2>&1) || rc=$?
+		scan_logs "$a" "$before_list" ""; rm -f "$before_list"
+		if [ "$rc" -eq 0 ] && [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
+			printf '%s\n' "$out" > "$ACC/$a/models.txt"
+			local cnt; cnt=$(printf '%s\n' "$out" | grep -cE '[a-z0-9]+-[a-z0-9]+' || true)
+			printf '%-20s 已缓存模型目录（约 %s 行）\n' "$a" "$cnt"
+		else
+			printf '%-20s 读取模型目录失败（rc=%s）\n' "$a" "$rc"
+		fi
+	done
+}
+
+cmd_usage() {
+	local which="${1:-all}" a first=1 st
+	local -a list=()
+	if [ "$which" = all ]; then
+		for a in $(list_accounts_sorted); do
+			st=$(status_of "$a")
+			case "$st" in
+				ok|exhausted:*) list+=("$a") ;;
+			esac
+		done
+	else
+		list=("$which")
+	fi
+	for a in "${list[@]}"; do
+		[ -f "$(token_of "$ACC/$a/home")" ] || { say "没有账号 $a"; continue; }
+		[ $first = 1 ] || sleep 20
+		first=0
+		local before_list; before_list=$(mktemp); sync_home "$(acct_home "$a")"
+		snapshot_log_files "$a" "$before_list"
+		local out; out=$( (cd /tmp && run_in "$(acct_home "$a")" "$AGY" -p "/usage") </dev/null 2>&1)
+		scan_logs "$a" "$before_list" ""; rm -f "$before_list"
+		if printf '%s\n' "$out" | grep -q $'\t'; then
+			printf '%s\n' "$out" | grep $'\t' > "$ACC/$a/usage.tsv"
+			local eg; eg=$(exhausted_group_of_status "$(status_of "$a")" 2>/dev/null || true)
+			if [ "$eg" = all ]; then
+				if quota_left "$a" "Gemini Models" && quota_left "$a" "Claude and GPT models" && quota_left "$a" "Argon"; then
+					echo ok > "$ACC/$a/status"
+				fi
+			elif [ -n "$eg" ] && quota_left "$a" "$(group_name_of_key "$eg")"; then
+				# 已恢复的组清除 exhausted；last_429.<组> 保留到自然过期，防 /usage 滞后复选
+				echo ok > "$ACC/$a/status"
+			fi
+			[ -s "$ACC/$a/plan" ] || probe_plan "$a" >/dev/null 2>&1 || true
+			local pl; pl=$(plan_of "$a")
+			echo "== $a ($(cat "$ACC/$a/email" 2>/dev/null)${pl:+, $pl})"; cat "$ACC/$a/usage.tsv"
+		else
+			echo "== $a：读额度失败"; printf '%s\n' "$out" | head -3
+		fi
+	done
+}
+
+cmd_ls() {
+	[ -f "$ROOT/PAUSED" ] && echo "⚠ 整池暂停：$(cat "$ROOT/PAUSED")"
+	local a cd_tag
+	for a in $(list_accounts_sorted); do
+		local u="" f="$ACC/$a/usage.tsv"
+		[ -f "$f" ] && u=$(awk -F'\t' '{split($2,w," "); printf "%s/%s=%s ", substr($1,1,6), w[1], $3}' "$f")" ($(date -r "$f" '+%m-%d %H:%M'))"
+		cd_tag=$(cooldown_tags "$a")
+		printf '%-20s %-30s %-7s %-22s %s%s\n' "$a" "$(cat "$ACC/$a/email" 2>/dev/null)" "$(plan_short "$a")" "$(status_of "$a" | cut -c1-22)" "$u" "$cd_tag"
+	done
+}
+
+# ---------- 交互选号（agyx -a 不带名字 / agyx select）----------
+acct_row() {
+	local a="$1" f="$ACC/$1/usage.tsv" u="额度未读（按 r 读取）" st pl
+	if [ -f "$f" ]; then
+		u=$(awk -F'\t' '{k=(($1 ~ /^Gemini/)?"G":"C") (($2 ~ /^Five/)?"5":"W"); v[k]=$3}
+			END{printf "Gemini 5h %s 周 %s | Claude/GPT 5h %s 周 %s", v["G5"]?v["G5"]:"-", v["GW"]?v["GW"]:"-", v["C5"]?v["C5"]:"-", v["CW"]?v["CW"]:"-"}' "$f")
+		u="$u  ($(date -r "$f" '+%m-%d %H:%M'))"
+	fi
+	st=$(status_of "$a" | cut -d: -f1)
+	pl=$(plan_short "$a")
+	printf '%-16s %-26s %-6s %-9s %s' "$a" "$(cat "$ACC/$a/email" 2>/dev/null)" "$pl" "$st" "$u"
+}
+
+menu_pick() {
+	local model="${1:-}" key seq i sel=0 total lines=0 note="" show_bad=0 bad_hidden=0
+	local -a all_names names
+	rebuild_menu_list() {
+		local a st
+		names=()
+		bad_hidden=0
+		# 可用账号按加权剩余额度排序置顶，其余按原序；默认隐藏 bad 账号防止小窗口滚出顶部
+		local -a ranked_nonbad=() seen_nonbad=()
+		mapfile -t ranked_nonbad < <(list_accounts | rank_accounts_for_pick "$model" "" 0)
+		local -a g0=() g1=() g2=()
+		for a in "${ranked_nonbad[@]}"; do
+			if usable "$a" "$model"; then g0+=("$a"); else g1+=("$a"); fi
+		done
+		for a in $(list_accounts); do
+			st=$(status_of "$a")
+			case "$st" in
+				ok|exhausted:*) ;;
+				*) g2+=("$a") ;;
+			esac
+		done
+		[ ${#g0[@]} -gt 0 ] && names+=("${g0[@]}")
+		[ ${#g1[@]} -gt 0 ] && names+=("${g1[@]}")
+		if [ "$show_bad" -eq 1 ]; then
+			[ ${#g2[@]} -gt 0 ] && names+=("${g2[@]}")
+		else
+			bad_hidden=${#g2[@]}
+		fi
+		total=${#names[@]}
+		if [ "$total" -eq 0 ] && [ ${#g2[@]} -gt 0 ]; then
+			show_bad=1; bad_hidden=0; names=("${g2[@]}"); total=${#names[@]}
+		fi
+		[ "$sel" -ge "$total" ] && sel=$(( total > 0 ? total - 1 : 0 ))
+	}
+	rebuild_menu_list
+	[ "$total" -gt 0 ] || die "账号池是空的，先 agyx login"
+	for ((i=0; i<total; i++)); do usable "${names[i]}" "$model" && { sel=$i; break; }; done
+	if ! [ -t 0 ] || ! [ -t 2 ] || [ "${TERM:-dumb}" = dumb ]; then
+		for ((i=0; i<total; i++)); do
+			local tag=""; usable "${names[i]}" "$model" || tag=" ✗"
+			printf '%d) %s%s\n' "$i" "$(acct_row "${names[i]}")" "$tag" >&2
+		done
+		[ "$bad_hidden" -gt 0 ] && printf '（已隐藏 %d 个 bad 账号；用 agx ls 查看全部）\n' "$bad_hidden" >&2
+		printf '选择编号 [%d]: ' "$sel" >&2; read -r key </dev/tty || return 130
+		[ -z "$key" ] && key=$sel
+		[[ "$key" =~ ^[0-9]+$ ]] && [ "$key" -lt "$total" ] || die "编号不对"
+		echo "${names[key]}"; return 0
+	fi
+	render() {
+		[ "$lines" -gt 0 ] && printf '\033[%dA' "$lines" >&2
+		printf '\033[J' >&2
+		local bad_hint
+		if [ "$show_bad" -eq 1 ]; then bad_hint="b 隐藏 bad 号"; else bad_hint="b 显示 ${bad_hidden} 个 bad 号"; fi
+		printf '\033[2K\r选择 agy 账号%s（按剩余容量置顶）\n' "${model:+（模型 $model）}" >&2
+		printf '\033[2K\r↑/↓ 选择 · 0-9 快选 · Enter 确认 · r 刷新 · %s · q/Esc 取消%s\n' "$bad_hint" "${note:+ · $note}" >&2
+		for ((i=0; i<total; i++)); do
+			local row; row=$(acct_row "${names[i]}")
+			local ok_flag=1 tag=""
+			usable "${names[i]}" "$model" || { ok_flag=0; tag=" ✗"; }
+			if ((i == sel)); then
+				printf '\033[2K\r\033[1;36m> %d) %s%s\033[0m\n' "$i" "$row" "$tag" >&2
+			elif ((ok_flag == 0)); then
+				printf '\033[2K\r\033[2m  %d) %s%s\033[0m\n' "$i" "$row" "$tag" >&2
+			else
+				printf '\033[2K\r  %d) %s%s\n' "$i" "$row" "$tag" >&2
+			fi
+		done
+		lines=$((total + 2))
+	}
+	trap 'printf "\033[?25h" >&2; exit 130' INT TERM HUP
+	printf '\033[?25l' >&2
+	render
+	while :; do
+		IFS= read -rsn1 key
+		case "$key" in
+			'') break ;;
+			q|Q) printf '\033[?25h' >&2; trap - INT TERM HUP; return 130 ;;
+			k) sel=$(( (sel - 1 + total) % total )) ;;
+			j) sel=$(( (sel + 1) % total )) ;;
+			b|B) show_bad=$((1 - show_bad)); rebuild_menu_list ;;
+			r|R) note="正在读 ${names[sel]} 的额度与套餐…"; render; cmd_usage "${names[sel]}" >/dev/null 2>&1; probe_plan "${names[sel]}" >/dev/null 2>&1 || true; note=""; rebuild_menu_list ;;
+			$'\033')
+				seq=''
+				if IFS= read -rsn2 -t 1 seq; then
+					case "$seq" in '[A') sel=$(( (sel - 1 + total) % total )) ;; '[B') sel=$(( (sel + 1) % total )) ;; esac
+				else printf '\033[?25h' >&2; trap - INT TERM HUP; return 130; fi ;;
+			[0-9]) [ "$key" -lt "$total" ] && { sel=$key; render; break; } ;;
+		esac
+		render
+	done
+	printf '\033[?25h' >&2; trap - INT TERM HUP
+	echo "${names[sel]}"
+}
+
+# ---------- 启动 agy ----------
+take_slot() { # 占一个该账号的并发位，fd 9 持有到进程结束；PER_ACCOUNT=0（默认）不限
+	local a="$1" i
+	[ "$PER_ACCOUNT" -gt 0 ] 2>/dev/null || return 0
+	while :; do
+		for i in $(seq 1 "$PER_ACCOUNT"); do
+			exec 9>"$ACC/$a/.slot.$i"
+			flock -n 9 && return 0
+			exec 9>&-
+		done
+		sleep 5
+	done
+}
+
+cmd_run() {
+	local acct="auto" safe=0 model="" prefer_plan="${AGYX_PREFER_PLAN:-}" args=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-a|--account)
+				if [ $# -lt 2 ] || [ "${2:0:1}" = - ]; then acct="?"; shift; else acct="$2"; shift 2; fi ;;
+			--account=*) acct="${1#*=}"; shift ;;
+			--prefer-plan) prefer_plan="${2:-}"; shift $(($# >= 2 ? 2 : 1)) ;;
+			--prefer-plan=*) prefer_plan="${1#*=}"; shift ;;
+			--safe) safe=1; shift ;;
+			--model) model="${2:-}"; [ $# -ge 2 ] && args+=("$1" "$2") || args+=("$1"); shift $(($# >= 2 ? 2 : 1)) ;;
+			--model=*) model="${1#*=}"; args+=("$1"); shift ;;
+			*) args+=("$1"); shift ;;
+		esac
+	done
+	check_paused
+	if [ "$acct" = "?" ]; then
+		acct=$(menu_pick "$model") || exit 130
+		say "使用账号 $acct"
+	elif [ "$acct" = auto ]; then
+		acct=$(AGYX_PREFER_PLAN="$prefer_plan" cmd_pick "$model") || die "没有可用的账号（都标了 bad / exhausted 或额度用尽），agyx ls 查看"
+		say "使用账号 $acct"
+	fi
+	[ -f "$(token_of "$ACC/$acct/home")" ] || die "没有账号 $acct（agyx ls 查看）"
+	if ! usable "$acct" "$model"; then
+		local rem
+		if rem=$(cooldown_left "$acct" "$model"); then
+			say "注意：$acct 仍在 429 冷却中（剩余 ${rem}m），仍按指定使用"
+		else
+			case "$(status_of "$acct")" in ok) say "注意：$acct 的${model:+ $model 所在组}额度已用尽或低于 ${AGYX_MIN_PCT:-2}%，仍按指定使用" ;;
+				*) say "注意：$acct 当前状态 $(status_of "$acct")，仍按指定使用" ;; esac
+		fi
+	fi
+	local h; h=$(acct_home "$acct"); sync_home "$h"
+	local sub="${args[0]:-}" extra=()
+	case "$sub" in
+		acp) extra=(--gemini-dir "$h/.gemini" --app-data-dir antigravity-cli); [ $safe = 1 ] || extra+=(--dangerously-skip-permissions)
+			args=(acp "${extra[@]}" "${args[@]:1}") ;;
+		agent|agents|changelog|help|install|mcp|mic-serve|models|plugin|plugins|remote-control|update) ;;
+		*) [ $safe = 1 ] || args=(--dangerously-skip-permissions "${args[@]}") ;;
+	esac
+	# 只有真正跑会话的调用占并发位；models、agent 这类查询子命令不占，避免被正在跑的会话卡住
+	case "$sub" in
+		agent|agents|changelog|help|install|mcp|models|plugin|plugins) ;;
+		*) take_slot "$acct"; date +%s > "$ACC/$acct/last_used" ;;
+	esac
+	local before_list; before_list=$(mktemp)
+	snapshot_log_files "$acct" "$before_list"
+	run_in "$h" "$AGY" "${args[@]}"
+	local rc=$?
+	scan_logs "$acct" "$before_list" "$model" || rc=$((rc ? rc : 1))
+	rm -f "$before_list"
+	return $rc
+}
+
+# ---------- 跨账号无损续接会话（handoff） ----------
+find_conv_owner() {
+	local cid="$1"
+	python3 -I - "$ACC" "$cid" <<'PY'
+import os, sys
+from pathlib import Path
+
+acc = Path(sys.argv[1])
+cid = sys.argv[2]
+best = None
+if acc.is_dir():
+    for d in sorted(acc.iterdir()):
+        db = d / "home/.gemini/antigravity-cli/conversations" / f"{cid}.db"
+        if not db.is_file():
+            continue
+        mt = db.stat().st_mtime
+        wal = db.with_name(f"{cid}.db-wal")
+        if wal.is_file():
+            mt = max(mt, wal.stat().st_mtime)
+        if best is None or mt > best[0]:
+            best = (mt, d.name)
+if best:
+    print(best[1])
+PY
+}
+
+cmd_handoff() {
+	local cid="" dst="" src="" no_run=0 force=0 model="" prefer_plan="${AGYX_PREFER_PLAN:-}"
+	local -a pass_args=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--from) [ $# -ge 2 ] || die "--from 缺少源账号"; src="$2"; shift 2 ;;
+			--from=*) src="${1#*=}"; shift ;;
+			--to) [ $# -ge 2 ] || die "--to 缺少目标账号"; dst="$2"; shift 2 ;;
+			--to=*) dst="${1#*=}"; shift ;;
+			--prefer-plan) [ $# -ge 2 ] || die "--prefer-plan 缺少参数"; prefer_plan="$2"; shift 2 ;;
+			--prefer-plan=*) prefer_plan="${1#*=}"; shift ;;
+			--no-run|--dry-copy) no_run=1; shift ;;
+			--force) force=1; shift ;;
+			--model) [ $# -ge 2 ] || die "--model 缺少模型名"; model="$2"; pass_args+=("$1" "$2"); shift 2 ;;
+			--model=*) model="${1#*=}"; pass_args+=("$1"); shift ;;
+			--) shift; pass_args+=("$@"); break ;;
+			-*) pass_args+=("$@"); break ;;
+			*)
+				if [ -z "$cid" ]; then cid="$1"; shift
+				elif [ -z "$dst" ]; then dst="$1"; shift
+				else pass_args+=("$@"); break
+				fi ;;
+		esac
+	done
+	[ -n "$cid" ] || die "用法：agyx handoff <会话ID> [目标账号] [--from 源账号] [--no-run] [--force] [agy 参数…]"
+	[[ "$cid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "会话 ID 格式不对：$cid"
+	if [ -n "$src" ]; then
+		[[ "$src" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "源账号名格式不对：$src"
+	fi
+	if [ -n "$dst" ] && [ "$dst" != auto ]; then
+		[[ "$dst" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "目标账号名格式不对：$dst"
+	fi
+	check_paused
+	if [ -z "$src" ]; then
+		src=$(find_conv_owner "$cid")
+		[ -n "$src" ] || die "账号池里找不到会话 $cid（没有对应的 conversations/$cid.db）"
+	fi
+	[ -f "$ACC/$src/home/.gemini/antigravity-cli/conversations/$cid.db" ] || die "源账号 $src 里找不到会话 $cid"
+	if [ -z "$dst" ] || [ "$dst" = auto ]; then
+		local excl="${AGYX_EXCLUDE_ACCOUNTS:+${AGYX_EXCLUDE_ACCOUNTS},}${src}"
+		dst=$(AGYX_EXCLUDE_ACCOUNTS="$excl" AGYX_PREFER_PLAN="$prefer_plan" cmd_pick "$model") || \
+			die "找不到可接收移交的下一个可用账号（已排除源账号 $src），agyx ls 查看"
+	fi
+	[ "$dst" != "$src" ] || die "源账号和目标账号都是 $src，无需移交"
+	[ -f "$(token_of "$ACC/$dst/home")" ] || die "目标账号不存在或未登录：$dst"
+	sync_home "$(acct_home "$dst")"
+
+	local src_root="$ACC/$src/home/.gemini/antigravity-cli"
+	local dst_root="$ACC/$dst/home/.gemini/antigravity-cli"
+	local cwd_now; cwd_now=$(pwd -P 2>/dev/null || pwd)
+	python3 -I - "$src_root" "$dst_root" "$cid" "$force" "$cwd_now" <<'PY' || die "移交会话文件失败"
+import json, os, shutil, sqlite3, sys
+from pathlib import Path
+
+src_root = Path(sys.argv[1])
+dst_root = Path(sys.argv[2])
+cid = sys.argv[3]
+force = sys.argv[4] == "1"
+cwd_now = sys.argv[5]
+
+src_db = src_root / "conversations" / f"{cid}.db"
+dst_conv_dir = dst_root / "conversations"
+dst_conv_dir.mkdir(parents=True, exist_ok=True)
+dst_db = dst_conv_dir / f"{cid}.db"
+
+if dst_db.is_file() and not force:
+    src_mt = max(src_db.stat().st_mtime, (src_db.with_name(f"{cid}.db-wal").stat().st_mtime if src_db.with_name(f"{cid}.db-wal").is_file() else 0))
+    dst_mt = max(dst_db.stat().st_mtime, (dst_db.with_name(f"{cid}.db-wal").stat().st_mtime if dst_db.with_name(f"{cid}.db-wal").is_file() else 0))
+    if dst_mt > src_mt:
+        print(f"目标账号已有更新的 {cid}.db（加 --force 才覆盖）", file=sys.stderr)
+        sys.exit(1)
+
+# SQLite backup API：WAL 模式下也能生成一致、独立的单文件副本，不修改源库
+tmp_db = dst_conv_dir / f".{cid}.db.handoff.{os.getpid()}"
+sconn = None
+dconn = None
+try:
+    sconn = sqlite3.connect(str(src_db), timeout=15)
+    dconn = sqlite3.connect(str(tmp_db))
+    sconn.backup(dconn)
+    dconn.close()
+    dconn = None
+    sconn.close()
+    sconn = None
+    os.chmod(tmp_db, 0o600)
+    for suf in (".db-wal", ".db-shm"):
+        p = dst_conv_dir / f"{cid}{suf}"
+        if p.exists():
+            p.unlink()
+    os.replace(tmp_db, dst_db)
+    for suf in (".db-wal", ".db-shm"):
+        p = dst_conv_dir / f"{cid}{suf}"
+        if p.exists():
+            p.unlink()
+finally:
+    if dconn is not None:
+        dconn.close()
+    if sconn is not None:
+        sconn.close()
+    if tmp_db.exists():
+        tmp_db.unlink()
+
+copied = ["conversations/*.db"]
+src_brain = src_root / "brain" / cid
+if src_brain.is_dir():
+    dst_brain = dst_root / "brain" / cid
+    dst_brain.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src_brain, dst_brain, dirs_exist_ok=True, symlinks=True)
+    copied.append("brain/")
+
+src_ann = src_root / "annotations" / f"{cid}.pbtxt"
+if src_ann.is_file():
+    dst_ann = dst_root / "annotations" / f"{cid}.pbtxt"
+    dst_ann.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_ann, dst_ann)
+    copied.append("annotations/")
+
+# 若源账号已信任当前 cwd，则把同一路径同步到目标账号的 trustedWorkspaces，避免换号续跑时再弹信任框
+src_sf = src_root / "settings.json"
+dst_sf = dst_root / "settings.json"
+try:
+    s_cfg = json.loads(src_sf.read_text(encoding="utf-8")) if src_sf.is_file() else {}
+    s_tw = s_cfg.get("trustedWorkspaces") if isinstance(s_cfg, dict) else None
+    if isinstance(s_tw, list) and cwd_now in s_tw:
+        d_cfg = json.loads(dst_sf.read_text(encoding="utf-8")) if dst_sf.is_file() else {}
+        if isinstance(d_cfg, dict):
+            d_tw = d_cfg.get("trustedWorkspaces")
+            if not isinstance(d_tw, list):
+                d_tw = []
+            if cwd_now not in d_tw:
+                d_tw.append(cwd_now)
+                d_cfg["trustedWorkspaces"] = d_tw
+                tmp_sf = dst_sf.with_name(f".settings.{os.getpid()}.tmp")
+                tmp_sf.write_text(json.dumps(d_cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                os.chmod(tmp_sf, 0o600)
+                os.replace(tmp_sf, dst_sf)
+                copied.append("trust(cwd)")
+except Exception:
+    pass
+
+print(", ".join(copied))
+PY
+	say "已将会话 $cid 从 $src 移交到 $dst（原账号副本保留未删）"
+	if [ "$no_run" -eq 1 ]; then
+		printf 'agx -a %q --conversation %q' "$dst" "$cid"
+		if [ ${#pass_args[@]} -gt 0 ]; then
+			printf ' %q' "${pass_args[@]}"
+		fi
+		printf '\n'
+		return 0
+	fi
+	cmd_run -a "$dst" --conversation "$cid" "${pass_args[@]}"
+}
+
+case "${1:-}" in
+	login) shift; cmd_login "$@" ;;
+	save) shift; cmd_save "$@" ;;
+	adopt) for d in "$ROOT"/.staging.*/home; do [ -f "$(token_of "$d")" ] && { say "收编 $d"; adopt_staging "$d"; }; done ;;
+	ls|list) cmd_ls ;;
+	usage|quota) shift; check_paused; cmd_usage "$@" ;;
+	plan|plans|tier) shift; check_paused; cmd_plan "$@" ;;
+	models-sync|models) shift; check_paused; cmd_models_sync "$@" ;;
+	pick) shift; cmd_pick "$@" ;;
+	handoff|migrate) shift; cmd_handoff "$@" ;;
+	select|menu) shift; cmd_run -a "?" "$@" ;;
+	pause) shift; pause_pool "${*:-手动暂停}" ;;
+	resume) rm -f "$ROOT/PAUSED"; say "已恢复。标成 bad 的号不会自动恢复，确认后 echo ok > $ACC/<名字>/status" ;;
+	env) shift; [ -n "${1:-}" ] || die "用法：agyx env <名字>"; acct_env "$1" ;;
+	-h|--help|--agyx-help) awk 'NR==1{next} /^set -u/{exit} {sub(/^# ?/,""); print}' "$0" ;;
+	*) cmd_run "$@" ;;
+esac
