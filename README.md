@@ -2,6 +2,20 @@
 
 轻量、无守护进程的多账号 [Antigravity CLI](https://antigravity.google)（`agy`）管理工具集。
 
+## 界面预览
+
+### 交互式选号菜单（`agx -a`）
+
+按 Ultra/Pro 加权剩余容量置顶排序，默认隐藏 `bad` 账号（按 `b` 切换显示），支持上下键 / 数字键快选与 `r` 键实时刷新单行额度：
+
+![agx -a 交互式选号菜单](docs/agx-menu.png)
+
+### 本地登录与测活面板（`agx-web`）
+
+面向远程开发机批量添加账号的可选本地 Web 页面（默认仅监听 `127.0.0.1:8789`，需 `web.token` 鉴权）：生成 OAuth 登录链接、提交回调授权码自动收编、在隔离环境实测可用性与额度（坏号仅标 `bad`，不会暂停整池）：
+
+![agx-web 本地管理面板](docs/agx-web.png)
+
 ## 设计原则
 
 - **每个账号独立 `HOME`**：每个账号拥有独立的 `~/.local/share/agy-pool/accounts/<账号名>/home/`，多终端并发互不覆盖 OAuth 凭据与会话库；真实家目录的 `git`、`ssh`、`.gemini/skills`、`.gemini/config` 等通过软链共享。
