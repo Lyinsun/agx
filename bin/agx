@@ -31,7 +31,7 @@
 #   AGYX_MIN_PCT（默认 2）：某组额度任一窗口剩余 ≤ 这个百分比且没到重置时间，就当作用尽
 #   AGYX_COOLDOWN_MIN（默认 15）：触发 429/额度耗尽后的短冷却分钟数，防 /usage 滞后复选；设 0 关闭
 #   AGYX_PICK_STRATEGY（默认 spread，可选 order）：spread 按 (套餐权重×剩余额度)/(1+活跃会话数) + LRU 轮转；order 按固定顺序
-#   AGYX_PREFER_PLAN：可选逗号分隔的优先套餐（如 pro / ultra）；不设时全池加权轮转（Ultra 权重 3、Pro 权重 1）
+#   AGYX_PREFER_PLAN：可选逗号分隔的优先套餐（如 pro / ultra）；不设时全池加权轮转（Ultra 权重 20、Pro 权重 1）
 #   agyx pause [原因] | resume                  整池暂停 / 恢复
 #   agyx env 名字                               打印该账号的环境变量（给别的脚本用）
 #   AGYX_PROXY：默认 keep（沿用当前 shell 代理）；可设为 http://127.0.0.1:7890 等固定出口，或写入 ~/.config/agx/config.env
@@ -314,7 +314,7 @@ plan_short() {
 		*plus*) echo "Plus" ;;
 		*enterprise*) echo "Ent" ;;
 		*team*|*business*) echo "Team" ;;
-		*free*|*standard*) echo "Free" ;;
+		*free*|*standard*|*starter*) echo "Free" ;;
 		*) printf '%.8s' "$p" ;;
 	esac
 }
@@ -560,9 +560,9 @@ rank_accounts_for_pick() {
 	gname=$(group_of "$model")
 	gkey=$(group_key "$gname")
 	python3 -I - "$ACC" "$model" "$gname" "$gkey" "$prefer" "$strategy" "$explain" \
-		"${AGYX_ULTRA_WEIGHT:-3.0}" "${AGYX_PRO_WEIGHT:-1.0}" "${AGYX_MIN_PCT:-2}" "${COOLDOWN_MIN:-15}" \
+		"${AGYX_ULTRA_WEIGHT:-20.0}" "${AGYX_PRO_WEIGHT:-1.0}" "${AGYX_MIN_PCT:-2}" "${COOLDOWN_MIN:-15}" \
 		"${AGYX_EXCLUDE_ACCOUNTS:-}" "$accts" <<'PY'
-import datetime, os, re, sys
+import datetime, math, os, re, sys
 from pathlib import Path
 
 acc_dir = Path(sys.argv[1])
@@ -639,8 +639,8 @@ def plan_short_and_weight(plan_raw: str) -> tuple[str, float]:
         return "Ent", w_pro
     if "team" in low or "business" in low:
         return "Team", w_pro
-    if "free" in low or "standard" in low:
-        return "Free", 0.5
+    if "free" in low or "standard" in low or "starter" in low:
+        return "Free", 0.2
     return "-", 0.8
 
 def matches_prefer(plan_raw: str, pshort: str) -> bool:
@@ -737,11 +737,14 @@ for idx, a in enumerate(all_accts):
 if strategy == "order":
     rows.sort(key=lambda r: (r["pref_tier"], r["idx"]))
 else:
-    # 先按 prefer_plan 分桶（若指定），再跳过不支持模型/坏号，按 5% 量化 avail_score 降序，同档按 LRU（last_used 升序）打平
+    # 先按 prefer_plan 分桶（若指定），再跳过不支持模型/坏号，按相对 5% 对数分桶 avail_score 降序，同档按 LRU（last_used 升序）打平
+    def avail_bucket(v: float) -> int:
+        return int(round(math.log(v) / math.log(1.05))) if v > 1e-6 else -10**9
+
     rows.sort(key=lambda r: (
         r["pref_tier"],
         0 if (not r["is_bad"] and r["ok_model"]) else 1,
-        -round(r["avail"] * 20),
+        -avail_bucket(r["avail"]),
         r["last_used"],
         r["idx"],
     ))

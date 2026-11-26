@@ -25,7 +25,7 @@ agx pick --explain gemini-4-neon-high
 1. **按模型映射额度组**：根据目标模型对应到 `Gemini`、`Claude/GPT` 或 `Argon` 额度组。
 2. **过滤不可用账号**：跳过 `bad:`、目标组处于 `exhausted:<组>` 或 15 分钟 429 冷却中、任一未到期窗口剩余 ≤ 2%，以及 `models.txt` 中不含目标模型的账号。
 3. **过期缓存自动复查**：额度缓存超过 30 分钟时，自动执行官方 `/usage` 刷新并重新判定。
-4. **按可用容量最高排序 + LRU 轮转**：实时统计本机各账号正在运行的 `agy` 活跃会话数 `LIVE`，按 **`AVAIL = (套餐权重 × 剩余比例) / (1 + LIVE)`** 从高到低选号（Ultra 权重 `3.0`、Pro 权重 `1.0`），同档位按最久未用（LRU）轮转——活跃会话多的号自动降权分流，新会话优先落到余量最高的 Ultra/Pro 号。
+4. **按可用容量最高排序 + LRU 轮转**：实时统计本机各账号正在运行的 `agy` 活跃会话数 `LIVE`，按 **`AVAIL = (套餐权重 × 剩余比例) / (1 + LIVE)`** 从高到低选号（Ultra 默认权重 `20.0`、Pro 权重 `1.0`、Free/Starter `0.2`，反映 Ultra 与 Pro 约 20 倍的真实额度差异），相对 5% 同档位按最久未用（LRU）轮转——活跃会话多的号自动降权分流，新会话优先落到余量最高的 Ultra/Pro 号。
 
 ### 2. 一个账号额度用完了怎么办？
 
@@ -115,7 +115,7 @@ agx ls
 | `AGYX_PROXY` | `keep` | `keep` 沿用当前 shell 代理；也可固定指定如 `http://127.0.0.1:7890` |
 | `AGYX_NO_PROXY` | `localhost,127.0.0.1,::1,10.0.0.0/8` | 固定代理时的直连列表 |
 | `AGYX_PICK_STRATEGY` | `spread` | `spread` 动态加权轮转；`order` 按 `order` 文件固定顺序用尽再换 |
-| `AGYX_ULTRA_WEIGHT` / `AGYX_PRO_WEIGHT` | `3.0` / `1.0` | Ultra 与 Pro 套餐容量权重 |
+| `AGYX_ULTRA_WEIGHT` / `AGYX_PRO_WEIGHT` | `20.0` / `1.0` | Ultra 与 Pro 套餐容量权重（匹配 20 倍真实额度差） |
 | `AGYX_PREFER_PLAN` | 空 | 留空为全池加权轮转；设为 `pro` 或 `ultra` 可限定优先套餐 |
 | `AGYX_MIN_PCT` | `2` | 目标模型组任一未到期窗口剩余 ≤ 该百分比视为耗尽 |
 | `AGYX_COOLDOWN_MIN` | `15` | 触发 429 后该模型组的短冷却分钟数（`0` 关闭） |

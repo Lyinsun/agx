@@ -153,31 +153,45 @@ echo "FAKE_AGY_ARGS: $*"
         )
         (self.pool / "order").write_text("pro1\nultra_low\nultra_high\n", encoding="utf-8")
 
-        # Default spread: ultra_high (3.0 * 0.98 = 2.94) beats ultra_low (2.40) and pro1 (1.00)
+        # Default spread: ultra_high (20.0 * 0.98 = 19.6) beats ultra_low (16.0) and pro1 (1.00)
         r = self.run_agx(["pick", "gemini-4-neon-high"])
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "ultra_high")
 
-        # --explain prints table header and winner
+        # --explain prints table header and winner with 20.0 Ultra weight
         r_exp = self.run_agx(["pick", "--explain", "gemini-4-neon-high"])
         self.assertEqual(r_exp.returncode, 0, r_exp.stderr)
         self.assertIn("ACCOUNT", r_exp.stderr)
-        self.assertIn("AVAIL", r_exp.stderr)
+        self.assertIn("20.0", r_exp.stderr)
         self.assertEqual(r_exp.stdout.strip(), "ultra_high")
 
-        # Tie-breaking via LRU when within same AVAIL bucket
+        # Tie-breaking via LRU when within relative 5% AVAIL bucket (98% vs 97% Ultra)
         make_account(
             self.pool,
             "ultra_tie",
             plan="Google AI Ultra",
             usage_rows=[
-                ("Gemini Models", "Five Hour", "98%", future),
+                ("Gemini Models", "Five Hour", "97%", future),
                 ("Gemini Models", "Weekly", "100%", future),
             ],
             last_used=10,
         )
         r_lru = self.run_agx(["pick", "gemini-4-neon-high"])
         self.assertEqual(r_lru.stdout.strip(), "ultra_tie")
+
+        # Ultra at 10% remaining (20.0 * 0.10 = 2.0) still beats idle Pro at 100% (1.0),
+        # while Ultra at 4% remaining (0.8) yields to idle Pro (1.0)
+        make_account(
+            self.pool,
+            "starter_acct",
+            plan="Antigravity Starter Quota",
+            usage_rows=[("Gemini Models", "Five Hour", "100%", future)],
+        )
+        r_low_u = self.run_agx(
+            ["pick", "gemini-4-neon-high"],
+            {"AGYX_EXCLUDE_ACCOUNTS": "ultra_high,ultra_tie,ultra_low"},
+        )
+        self.assertEqual(r_low_u.stdout.strip(), "pro1")
 
         # --prefer-plan pro overrides Ultra
         r_pro = self.run_agx(["pick", "--prefer-plan", "pro", "gemini-4-neon-high"])
